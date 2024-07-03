@@ -25,7 +25,7 @@
 # - Tests
 # - Many features in experimental
 # - Host Tools (i.e conversion / analysis tools etc.)
-
+# Modified By Abd Alrahman Atieh abdalrahman.atieh@gmail.com
 cmake_minimum_required(VERSION 3.15)
 if(NOT CMAKE_BUILD_TYPE)
   message(STATUS "Setting build type to Release, for debug builds use"
@@ -537,6 +537,8 @@ target_link_libraries(benchmark_model
 )
 
 # label_image tool
+find_package(OpenCV REQUIRED)
+
 list(APPEND TFLITE_CMD_LINE_TOOLS_SRCS
     ${TFLITE_SOURCE_DIR}/tools/command_line_flags.cc
     ${TFLITE_SOURCE_DIR}/tools/tool_params.cc
@@ -545,6 +547,7 @@ list(APPEND TFLITE_CMD_LINE_TOOLS_SRCS
 list(APPEND TFLITE_LABEL_IMAGE_SRCS
     ${TFLITE_SOURCE_DIR}/examples/label_image/bitmap_helpers.cc
     ${TFLITE_SOURCE_DIR}/examples/label_image/label_image.cc
+    ${TFLITE_SOURCE_DIR}/examples/label_image/rtsp_boy.cc
     ${TFLITE_SOURCE_DIR}/tools/evaluation/utils.cc
 )
 
@@ -560,6 +563,8 @@ target_compile_options(label_image
 
 target_link_libraries(label_image
   ${TFLITE_BENCHMARK_LIBS}
+  ${OpenCV_LIBS}
+  
 )
 
 # unit test dependencies
@@ -615,12 +620,8 @@ if(TFLITE_BUILD_EVALTOOLS)
     list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_CMD_LINE_TOOLS_SRCS})
     list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_EVALUATION_STAGES_SRCS})
     list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_EVALUATION_PROTO_SRCS})
-    if(TFLITE_ENABLE_NNAPI)
-        list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_SOURCE_DIR}/tools/delegates/nnapi_delegate_provider.cc)
-    endif()
-    if(TFLITE_ENABLE_XNNPACK)
-        list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_SOURCE_DIR}/tools/delegates/xnnpack_delegate_provider.cc)
-    endif()
+    list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_SOURCE_DIR}/tools/delegates/nnapi_delegate_provider.cc)
+    list(APPEND TFLITE_EVALUATION_BINARY_SRCS ${TFLITE_SOURCE_DIR}/tools/delegates/xnnpack_delegate_provider.cc)
 
 
     add_executable(coco_object_detection_run_eval
@@ -658,4 +659,3 @@ if(TFLITE_BUILD_EVALTOOLS)
             ${TFLITE_BENCHMARK_CC_OPTIONS})
     endforeach()
 endif()
-
