@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/lite/examples/label_image/label_image.h"
-
 #include <fcntl.h>      // NOLINT(build/include_order)
 #include <getopt.h>     // NOLINT(build/include_order)
 #include <sys/time.h>   // NOLINT(build/include_order)
@@ -30,10 +29,13 @@ limitations under the License.
 #include <iostream>
 #include <map>
 #include <memory>
+#include <opencv2/opencv.hpp>
 #include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <arpa/inet.h>
+
 
 #include "absl/memory/memory.h"
 #include "tensorflow/lite/delegates/nnapi/nnapi_delegate.h"
@@ -53,14 +55,139 @@ limitations under the License.
 #endif
 
 #define LOG(severity) (std::cerr << (#severity) << ": ")
+#define RUNNING 1
+#define STOPPED 0
+#define ERROR -1
+#define UDP_PORT 6789
+#define BUF_SIZE 1024
+#define LINE_SIZE 50
+#define SENDING_INTERVAL 1 // seconds
+
+struct Client {
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+};
+
+std::vector<Client> clients;
+
+void add_client(struct sockaddr_in* client_addr, socklen_t addr_len) {
+    for (const auto& client : clients) {
+        if (client.addr.sin_addr.s_addr == client_addr->sin_addr.s_addr &&
+            client.addr.sin_port == client_addr->sin_port) {
+            // Client already in list
+            return;
+        }
+    }
+
+    Client new_client;
+    new_client.addr = *client_addr;
+    new_client.addr_len = addr_len;
+    clients.push_back(new_client);
+}
+
+
+
+void send_data_to_clients(int sockfd, std::vector<std::vector<float>> message, cv::Mat frame) {
+    int lines =message.size(); 
+    if (lines <= 0) return;
+    std::string out;
+    for (int l = 0; l < lines ; l++) {
+      char line [50];
+      sprintf(line, "[%f, %f, %f, %f, %f, %f]\n", message[l][0], 
+                                                 message[l][1],
+                                                 message[l][2],
+                                                 message[l][3],
+                                                 message[l][4],
+                                                 message[l][5]); 
+      out += line; 
+    } 
+
+    int msg_size = out.size();
+    for (const auto& client : clients) {
+        sendto(sockfd, out.c_str(), msg_size, 0,
+               (struct sockaddr*)&client.addr, client.addr_len);
+    }
+}
 
 namespace tflite {
 namespace label_image {
+
+// Default for SSD_MOBILENET_300x300
+int argWidth = 320; 
+int argHeight = 320; 
+int CHANNELS = 3;
+const std::string URL = "rtsp://bolt:bolt@192.168.10.90/axis-media/media.amp";
+
+
+
 
 double get_us(struct timeval t) { return (t.tv_sec * 1000000 + t.tv_usec); }
 
 using TfLiteDelegatePtr = tflite::Interpreter::TfLiteDelegatePtr;
 using TfLiteDelegatePtrMap = std::map<std::string, TfLiteDelegatePtr>;
+
+
+class RTSP_BOY {
+public:
+    cv::VideoCapture cap;
+    std::string url;
+    int status;
+    std::string err_msg;
+
+    RTSP_BOY(std::string url = URL) : url(url), status(RUNNING) {
+        open_stream();
+    }
+
+    int open_stream() {
+        int tries = 30;
+        cap.open(url);
+        
+        if (!cap.isOpened()) {
+            status = ERROR;
+            err_msg = "Could not open rtsp stream: " + url;
+            return ERROR;
+        }
+
+        double last_frame_num = cap.get(cv::CAP_PROP_FRAME_COUNT);
+        cap.set(cv::CAP_PROP_POS_FRAMES, last_frame_num);
+
+        status = RUNNING;
+        return RUNNING;
+    }
+
+    cv::Mat get_last_frame() {
+        cv::Mat frame;
+        bool ret = cap.read(frame);
+
+        if (!ret) {
+            status = ERROR;
+            err_msg = "Could not read frame from " + url;
+        }
+        return frame;
+    }
+
+    void close_stream() {
+        cap.release();
+    }
+};
+void PrintTensorInfo(const TfLiteTensor* tensor) {
+    // Print the tensor name
+    if (tensor->name) {
+        std::cout << "Tensor Name: " << tensor->name << std::endl;
+    } else {
+        std::cout << "Tensor Name: (unnamed)" << std::endl;
+    }
+
+    // Print the shape of the tensor
+    std::cout << "Tensor Shape: [";
+    for (int i = 0; i < tensor->dims->size; ++i) {
+        std::cout << tensor->dims->data[i];
+        if (i < tensor->dims->size - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << "]" << std::endl;
+}
 
 class DelegateProviders {
  public:
@@ -228,16 +355,59 @@ void PrintProfilingInfo(const profiling::ProfileEvent* e,
                    static_cast<BuiltinOperator>(registration.builtin_code))
             << "\n";
 }
+cv::Mat resizeAndReshape(cv::Mat src, int width, int height, int dtype) {
+    cv::Mat resized, reshaped, converted;
+    
+    // Resize the source image to the specified width and height
+    cv::resize(src, resized, cv::Size(width, height));
+    
+    // Convert the resized image to the specified data type
+    switch(dtype) {
+        case kTfLiteFloat32: // float
+            resized.convertTo(converted, CV_32F, 1.0 / 255, 0);
+            break;
+        case kTfLiteInt8: // int8
+            resized.convertTo(converted, CV_8S);
+            break;
+        case kTfLiteUInt8: // uint
+            resized.convertTo(converted, CV_8U);
+            break;
+        default:
+            converted = resized; // If the dtype is not recognized, do not convert
+            break;
+    }
+    
+    // Reshape the converted image to 4D for deep learning model input
+    reshaped = converted.reshape(1, std::vector<int>{1, height, width, 3});
+    // LOG(INFO) << "IMAGE CONVERTED!\n";
+    return reshaped;
+}
 
-void RunInference(Settings* settings,
-                  const DelegateProviders& delegate_providers) {
-  if (!settings->model_name.c_str()) {
+
+std::string decodeOutputType(int i){
+  if (i == 1) {
+    return "Float 32";
+  } 
+  if (i == 2) {
+    return "int 8";
+  }
+  if (i == 3) {
+    return "uint 8";
+  }
+  return "Unkown";
+}
+void RunInference(Settings* settings, const DelegateProviders& delegate_providers) {
+  
+  /* ---------------------------------------------------------
+                            Load the model 
+     --------------------------------------------------------- */
+   if (!settings->model_name.c_str()) {
     LOG(ERROR) << "no model file name\n";
     exit(-1);
   }
+  std::unique_ptr<tflite::Interpreter> interpreter;
 
   std::unique_ptr<tflite::FlatBufferModel> model;
-  std::unique_ptr<tflite::Interpreter> interpreter;
   model = tflite::FlatBufferModel::BuildFromFile(settings->model_name.c_str());
   if (!model) {
     LOG(ERROR) << "\nFailed to mmap model " << settings->model_name << "\n";
@@ -256,46 +426,24 @@ void RunInference(Settings* settings,
     exit(-1);
   }
 
-  interpreter->SetAllowFp16PrecisionForFp32(settings->allow_fp16);
+  // interpreter->SetAllowFp16PrecisionForFp32(settings->allow_fp16);
 
   if (settings->verbose) {
     LOG(INFO) << "tensors size: " << interpreter->tensors_size() << "\n";
     LOG(INFO) << "nodes size: " << interpreter->nodes_size() << "\n";
     LOG(INFO) << "inputs: " << interpreter->inputs().size() << "\n";
     LOG(INFO) << "input(0) name: " << interpreter->GetInputName(0) << "\n";
-
-    int t_size = interpreter->tensors_size();
-    for (int i = 0; i < t_size; i++) {
-      if (interpreter->tensor(i)->name)
-        LOG(INFO) << i << ": " << interpreter->tensor(i)->name << ", "
-                  << interpreter->tensor(i)->bytes << ", "
-                  << interpreter->tensor(i)->type << ", "
-                  << interpreter->tensor(i)->params.scale << ", "
-                  << interpreter->tensor(i)->params.zero_point << "\n";
-    }
   }
 
   if (settings->number_of_threads != -1) {
     interpreter->SetNumThreads(settings->number_of_threads);
   }
 
-  int image_width = 224;
-  int image_height = 224;
-  int image_channels = 3;
-  std::vector<uint8_t> in = read_bmp(settings->input_bmp_name, &image_width,
-                                     &image_height, &image_channels, settings);
-
-  int input = interpreter->inputs()[0];
-  if (settings->verbose) LOG(INFO) << "input: " << input << "\n";
-
-  const std::vector<int> inputs = interpreter->inputs();
-  const std::vector<int> outputs = interpreter->outputs();
-
-  if (settings->verbose) {
-    LOG(INFO) << "number of inputs: " << inputs.size() << "\n";
-    LOG(INFO) << "number of outputs: " << outputs.size() << "\n";
-  }
-
+  /* ---------------------------------------------------------
+                            Apply NNAPI deleget
+                            (Run on NPU) 
+     --------------------------------------------------------- */
+  
   auto delegates_ = GetDelegates(settings, delegate_providers);
   for (const auto& delegate : delegates_) {
     if (interpreter->ModifyGraphWithDelegate(delegate.second.get()) !=
@@ -307,128 +455,253 @@ void RunInference(Settings* settings,
     }
   }
 
+
+
+  /* ---------------------------------------------------------
+                            Get Info About the Model 
+     --------------------------------------------------------- */
+
   if (interpreter->AllocateTensors() != kTfLiteOk) {
     LOG(ERROR) << "Failed to allocate tensors!\n";
     exit(-1);
   }
+  int input = interpreter->inputs()[0];
+  if (settings->verbose) LOG(INFO) << "input: " << input << "\n";
 
-  if (settings->verbose) PrintInterpreterState(interpreter.get());
+  const std::vector<int> inputs = interpreter->inputs();
+  const std::vector<int> outputs = interpreter->outputs();
 
-  // get input dimension from the input tensor metadata
-  // assuming one input only
-  TfLiteIntArray* dims = interpreter->tensor(input)->dims;
-  int wanted_height = dims->data[1];
-  int wanted_width = dims->data[2];
-  int wanted_channels = dims->data[3];
+  if (settings->verbose) {
+    LOG(INFO) << "number of inputs: " << inputs.size() << "\n";
+    LOG(INFO) << "number of outputs: " << outputs.size() << "\n";
 
-  settings->input_type = interpreter->tensor(input)->type;
-  switch (settings->input_type) {
-    case kTfLiteFloat32:
-      resize<float>(interpreter->typed_tensor<float>(input), in.data(),
-                    image_height, image_width, image_channels, wanted_height,
-                    wanted_width, wanted_channels, settings);
-      break;
-    case kTfLiteInt8:
-      resize<int8_t>(interpreter->typed_tensor<int8_t>(input), in.data(),
-                     image_height, image_width, image_channels, wanted_height,
-                     wanted_width, wanted_channels, settings);
-      break;
-    case kTfLiteUInt8:
-      resize<uint8_t>(interpreter->typed_tensor<uint8_t>(input), in.data(),
-                      image_height, image_width, image_channels, wanted_height,
-                      wanted_width, wanted_channels, settings);
-      break;
-    default:
-      LOG(ERROR) << "cannot handle input type "
-                 << interpreter->tensor(input)->type << " yet\n";
-      exit(-1);
-  }
-  auto profiler = absl::make_unique<profiling::Profiler>(
-      settings->max_profiling_buffer_entries);
-  interpreter->SetProfiler(profiler.get());
-
-  if (settings->profiling) profiler->StartProfiling();
-  if (settings->loop_count > 0) {
-    for (int i = 0; i < settings->number_of_warmup_runs; i++) {
-      if (interpreter->Invoke() != kTfLiteOk) {
-        LOG(ERROR) << "Failed to invoke tflite!\n";
-        exit(-1);
-      }
+    for (int i = 0; i < outputs.size(); i++) {
+        int output = outputs[i];
+        TfLiteIntArray* out_dims = interpreter->tensor(output)->dims;
+        LOG(INFO) << "Output  [" << i << "]'s shape: " << " [" <<  out_dims->data[0] << " " << out_dims->data[1] << " " << out_dims->data[2] << " " << out_dims->data[3] << " ]" << " Type: " << decodeOutputType(interpreter->tensor(output)->type) << "\n"; 
+    }
+    for (int i = 0; i < inputs.size(); i++) {
+        int input = inputs[i];
+        TfLiteIntArray* in_dims = interpreter->tensor(input)->dims;
+        LOG(INFO) << "Input  [" << i << "]'s shape: " << " [" <<  in_dims->data[0] << " " << in_dims->data[1] << " " << in_dims->data[2] << " " << in_dims->data[3] << " ]" << " Type: " << decodeOutputType(interpreter->tensor(input)->type) << "\n" ; 
     }
   }
-
+  
+  /* ---------------------------------------------------------
+                            Start Video 
+     --------------------------------------------------------- */
   struct timeval start_time, stop_time;
   gettimeofday(&start_time, nullptr);
-  for (int i = 0; i < settings->loop_count; i++) {
+
+  RTSP_BOY boy(URL);
+
+  if (boy.status != RUNNING) {
+      LOG(ERROR) << boy.err_msg << std::endl;
+  } else {
+    LOG(INFO) << "Video from " << URL << " is estab.\n";
+  }
+  gettimeofday(&stop_time, nullptr);
+  LOG(INFO) << "RTSP_BOY init time: " << (get_us(stop_time) - get_us(start_time)) / 1000 << " ms \n";
+
+  
+  /* ---------------------------------------------------------
+                          Setup the UDP server 
+    --------------------------------------------------------- */
+    int sockfd;
+    struct sockaddr_in server_addr, client_addr;
+    char buffer[BUF_SIZE];
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    // Create socket
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    memset(&client_addr, 0, sizeof(client_addr));
+
+    // Fill server information
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(UDP_PORT);
+
+    // Bind the socket with the server address
+    if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    LOG(INFO) << "UDP server is running on port "<< UDP_PORT <<" and waiting for clients..." << std::endl;
+
+/* ---------------------------------------------------------
+                            Detection Loop 
+    --------------------------------------------------------- */
+  while (true) {
+
+/* ---------------------------------------------------------
+                            Listen for new clients
+                            (ideally you will be using threads..) 
+  --------------------------------------------------------- */
+
+  // Receive message from clients (this is just to register clients)
+    int n = recvfrom(sockfd, buffer, BUF_SIZE, MSG_DONTWAIT, (struct sockaddr*)&client_addr, &client_addr_len);
+    if (n > 0) {
+        buffer[n] = '\0';
+        LOG(INFO) << "Received message from client: " << buffer << std::endl;
+        add_client(&client_addr, client_addr_len);
+    }
+
+
+  /* ---------------------------------------------------------
+                            Get a Frame 
+    --------------------------------------------------------- */
+    gettimeofday(&start_time, nullptr);
+    cv::Mat frame = boy.get_last_frame();
+    if (boy.status != RUNNING) {
+          LOG(ERROR) << boy.err_msg << std::endl;
+    }
+    gettimeofday(&stop_time, nullptr);
+    // LOG(INFO) << "boy.get_last_frame() avg time: " << (get_us(stop_time) - get_us(start_time)) / (1000)  << " ms \n";
+
+
+  /* ---------------------------------------------------------
+                            Resize the Frame 
+    --------------------------------------------------------- */
+   
+
+    cv::Mat in = resizeAndReshape(frame, argWidth, argHeight,settings->input_type );
+
+
+    
+    /* ---------------------------------------------------------
+                              Copy the data to input_Layer 
+      --------------------------------------------------------- */
+    gettimeofday(&start_time, nullptr);
+    settings->input_type = interpreter->tensor(input)->type;
+    int totalSizeInput = argWidth * argHeight * 3;
+    switch (settings->input_type) {
+      case kTfLiteFloat32:
+        LOG(INFO) << "Input type: kTfLiteFloat32\n";
+        for (int i = 0; i < totalSizeInput; i++ ) {
+          interpreter->typed_input_tensor<float>(input)[i] = in.data[i];
+        }
+        break;
+      case kTfLiteInt8:
+        for (int i = 0; i < totalSizeInput; i++ ) {
+          interpreter->typed_input_tensor<int8_t>(input)[i] = in.at<int8_t>(i);
+        }
+        break;
+      case kTfLiteUInt8:
+        for (int i = 0; i < totalSizeInput; i++ ) {
+          interpreter->typed_input_tensor<uint8_t>(input)[i] = in.at<uint8_t>(i);
+        }
+        break;
+      default:
+        LOG(ERROR) << "cannot handle input type "
+                  << interpreter->tensor(input)->type << " yet\n";
+        exit(-1);
+    }
+    gettimeofday(&stop_time, nullptr);
+    // LOG(INFO) << "copy data to input layer time: " << (get_us(stop_time) - get_us(start_time)) / (1000)  << " ms \n";
+
+
+
+    /* ---------------------------------------------------------
+                              Make a detection 
+      --------------------------------------------------------- */
+    gettimeofday(&start_time, nullptr);
     if (interpreter->Invoke() != kTfLiteOk) {
       LOG(ERROR) << "Failed to invoke tflite!\n";
       exit(-1);
     }
-  }
-  gettimeofday(&stop_time, nullptr);
-  LOG(INFO) << "invoked\n";
-  LOG(INFO) << "average time: "
-            << (get_us(stop_time) - get_us(start_time)) /
-                   (settings->loop_count * 1000)
-            << " ms \n";
+    gettimeofday(&stop_time, nullptr);
+    // LOG(INFO) << "Invoke time: " << (get_us(stop_time) - get_us(start_time)) / (1000)  << " ms \n";
 
-  if (settings->profiling) {
-    profiler->StopProfiling();
-    auto profile_events = profiler->GetProfileEvents();
-    for (int i = 0; i < profile_events.size(); i++) {
-      auto subgraph_index = profile_events[i]->extra_event_metadata;
-      auto op_index = profile_events[i]->event_metadata;
-      const auto subgraph = interpreter->subgraph(subgraph_index);
-      const auto node_and_registration =
-          subgraph->node_and_registration(op_index);
-      const TfLiteRegistration registration = node_and_registration->second;
-      PrintProfilingInfo(profile_events[i], subgraph_index, op_index,
-                         registration);
+
+    /* ---------------------------------------------------------
+                              Get the output 
+      --------------------------------------------------------- */
+
+    const float threshold = 0.001f;
+
+    int outputSize = outputs.size(); 
+
+    // Total number of detected objects StatefulPartitionedCall:0
+    TfLiteTensor* num_detec = interpreter->tensor(interpreter->outputs()[2]);
+    // PrintTensorInfo(num_detec);
+
+    // Confidence of detected objects StatefulPartitionedCall:1
+    TfLiteTensor* scores    = interpreter->tensor(interpreter->outputs()[0]);
+    // PrintTensorInfo(scores);
+
+    // Class index of detected objects StatefulPartitionedCall:2
+    TfLiteTensor* classes   = interpreter->tensor(interpreter->outputs()[3]);
+    // PrintTensorInfo(classes);
+
+    // Bounding box coordinates of detected objects StatefulPartitionedCall:3
+    TfLiteTensor* bboxes    = interpreter->tensor(interpreter->outputs()[1]);
+    // PrintTensorInfo(bboxes);
+
+
+    auto          bboxes_   = bboxes->data.f;
+    auto          classes_  = classes->data.f;
+    auto          scores_   = scores->data.f;
+    
+    auto bboxes_xywh        = bboxes->dims->data[bboxes->dims->size - 1]; 
+    auto classes_size       = classes->dims->data[classes->dims->size - 1];
+    auto scores_size        = scores->dims->data[scores->dims->size - 1];
+
+    
+    
+    if (bboxes_xywh != 4){
+        std::cerr << "Incorrect bbox size: " << bboxes_xywh << std::endl;
+        exit(0);
     }
+    if (classes_size != scores_size){
+        std::cerr << "Number of classes and scores does not match: " << classes_size << " " << scores_size << std::endl;
+        exit(0);
+    }
+
+    std::vector<float> locations;
+    std::vector<float> cls;
+
+    for (int i = 0; i < bboxes_xywh * classes_size; i++){
+        locations.push_back(bboxes_[i]);
+    }
+
+    for (int i = 0; i < classes_size; i++){
+        cls.push_back(classes_[i]);
+    }
+
+
+    std::vector<std::vector<float>> detections;
+    for(int j = 0; j <locations.size(); j+=4){
+        float score = scores_[j];
+        if (score < 0.1 || score > 1)
+         continue;
+
+        float cls = classes_[j];
+
+        auto top=locations[j]  *argHeight;
+        auto left=locations[j+1]*argWidth;
+        auto down=locations[j+2]*argHeight;
+        auto right=locations[j+3]*argWidth;
+        std::vector<float> det {cls, score, top, left, down, right};
+        
+        detections.push_back(det);
+    }
+  /* ---------------------------------------------------------
+                            send the output to clients 
+  --------------------------------------------------------- */
+    send_data_to_clients(sockfd, detections, in);
+    
+    
   }
+    boy.close_stream();
+    close(sockfd);
 
-  const float threshold = 0.001f;
-
-  std::vector<std::pair<float, int>> top_results;
-
-  int output = interpreter->outputs()[0];
-  TfLiteIntArray* output_dims = interpreter->tensor(output)->dims;
-  // assume output dims to be something like (1, 1, ... ,size)
-  auto output_size = output_dims->data[output_dims->size - 1];
-  switch (interpreter->tensor(output)->type) {
-    case kTfLiteFloat32:
-      get_top_n<float>(interpreter->typed_output_tensor<float>(0), output_size,
-                       settings->number_of_results, threshold, &top_results,
-                       settings->input_type);
-      break;
-    case kTfLiteInt8:
-      get_top_n<int8_t>(interpreter->typed_output_tensor<int8_t>(0),
-                        output_size, settings->number_of_results, threshold,
-                        &top_results, settings->input_type);
-      break;
-    case kTfLiteUInt8:
-      get_top_n<uint8_t>(interpreter->typed_output_tensor<uint8_t>(0),
-                         output_size, settings->number_of_results, threshold,
-                         &top_results, settings->input_type);
-      break;
-    default:
-      LOG(ERROR) << "cannot handle output type "
-                 << interpreter->tensor(output)->type << " yet\n";
-      exit(-1);
-  }
-
-  std::vector<string> labels;
-  size_t label_count;
-
-  if (ReadLabelsFile(settings->labels_file_name, &labels, &label_count) !=
-      kTfLiteOk)
-    exit(-1);
-
-  for (const auto& result : top_results) {
-    const float confidence = result.first;
-    const int index = result.second;
-    LOG(INFO) << confidence << ": " << index << " " << labels[index] << "\n";
-  }
 }
 
 void display_usage() {
@@ -450,6 +723,8 @@ void display_usage() {
       << "--verbose, -v: [0|1] print more information\n"
       << "--warmup_runs, -w: number of warmup runs\n"
       << "--xnnpack_delegate, -x [0:1]: xnnpack delegate\n"
+      << "--argWidth, -o \n"
+      << "--argHeight, -n \n"
       << "\n";
 }
 
@@ -483,13 +758,15 @@ int Main(int argc, char** argv) {
         {"gl_backend", required_argument, nullptr, 'g'},
         {"hexagon_delegate", required_argument, nullptr, 'j'},
         {"xnnpack_delegate", required_argument, nullptr, 'x'},
+        {"argWidth", required_argument, nullptr, 'o'},
+        {"argHeight", required_argument, nullptr, 'n'},
         {nullptr, 0, nullptr, 0}};
 
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
     c = getopt_long(argc, argv,
-                    "a:b:c:d:e:f:g:i:j:l:m:p:r:s:t:v:w:x:", long_options,
+                    "a:b:c:d:e:f:g:i:j:l:m:p:r:s:t:v:w:x:o:n", long_options,
                     &option_index);
 
     /* Detect the end of the options. */
@@ -557,6 +834,12 @@ int Main(int argc, char** argv) {
         s.xnnpack_delegate =
             strtol(optarg, nullptr, 10);  // NOLINT(runtime/deprecated_fn)
         break;
+      case 'o':
+        argHeight = strtol(optarg, nullptr, 10);
+        break;
+      case 'n':
+        argWidth = strtol(optarg, nullptr, 10);
+        break;
       case 'h':
       case '?':
         /* getopt_long already printed an error message. */
@@ -564,8 +847,9 @@ int Main(int argc, char** argv) {
         exit(-1);
       default:
         exit(-1);
-    }
-  }
+   }
+ }
+  
   RunInference(&s, delegate_providers);
   return 0;
 }
